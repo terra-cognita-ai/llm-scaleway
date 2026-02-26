@@ -28,9 +28,14 @@ cp .env.example .env
 	 - `SCW_ZONE` (example: `fr-par-2`)
 	 - `SCW_COMMERCIAL_TYPE` (default: `L4-1-24G`)
 	 - `SCW_SERVER_NAME`
+	 - `SCW_SERVER_IP` (`dynamic` by default, avoids billable flexible IP allocation)
+	 - `SCW_DETACH_PUBLIC_IP_AFTER_DEPLOY` (`true` to bootstrap over public IP then detach it automatically)
+	 - `SCW_PRIVATE_NETWORK_NAME` (required when `SCW_SERVER_IP=none`, e.g. `schligler-ia-app`)
 	 - `VLLM_IMAGE` (defaults to `vllm/vllm-openai:latest`, can be pinned)
 	 - `VLLM_BIND_IP` (host interface bind, default `0.0.0.0`)
 	 - `VLLM_ALLOWED_CIDRS` (comma-separated source CIDRs allowed to call the API)
+	 - `VLLM_ALLOWED_CIDRS_FROM_SERVER_NAME` (optional instance name to auto-add as `/32`, e.g. `schligler-ia-parser`)
+	 - `VLLM_READY_TIMEOUT_SEC` (max wait before deploy fails if `/v1/models` is not ready)
 	 - `SCW_SSH_PUBLIC_KEY_PATH` (public key injected via cloud-init)
 	 - `SCW_SSH_PRIVATE_KEY_PATH` (private key used by local `ssh/scp`)
 	 - `HUGGING_FACE_HUB_TOKEN` (if model access requires it)
@@ -76,6 +81,8 @@ VLLM_ALLOWED_CIDRS=163.172.162.19/32
 
 - `VLLM_ALLOWED_CIDRS` is a comma-separated CIDR allowlist applied on the server firewall for `VLLM_PORT`.
 - `/32` means one exact source IP.
+- Set `VLLM_ALLOWED_CIDRS_FROM_SERVER_NAME=schligler-ia-parser` to auto-resolve and append `/32` during deploy/redeploy.
+- When `SCW_PRIVATE_NETWORK_NAME` is set, scripts prefer that instance private IPv4 on this network; otherwise they fall back to public IP.
 - Keep it empty only if you intentionally want public access.
 
 After updating `.env`, apply changes without recreating the instance:
@@ -121,6 +128,10 @@ If you see OOM under load, lower:
 ## Notes
 
 - `SCW_IMAGE` can be left empty: deploy script auto-resolves a Ubuntu 22.04 image in the selected zone.
+- `SCW_SERVER_IP=dynamic` avoids creating a billable flexible IP while still exposing a public dynamic IP for SSH/API access.
+- Simple private final state: set `SCW_SERVER_IP=dynamic` and `SCW_DETACH_PUBLIC_IP_AFTER_DEPLOY=true` so deploy can bootstrap, then removes public IP automatically.
+- Set `SCW_SERVER_IP=none` for no public IP; in that mode set `SCW_PRIVATE_NETWORK_NAME` so deploy attaches a private NIC and uses the private IP for SSH/bootstrap.
+- If private-network lookup needs to be forced, set `SCW_REGION` (defaults to region derived from `SCW_ZONE`, e.g. `fr-par-1` -> `fr-par`).
 - Access to port `8000` can be restricted directly from `.env` with `VLLM_ALLOWED_CIDRS`.
 - Example for a single caller instance: `VLLM_ALLOWED_CIDRS=51.15.12.34/32`
 - Example for a private subnet: `VLLM_ALLOWED_CIDRS=10.0.0.0/24`

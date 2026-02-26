@@ -26,10 +26,25 @@ SCW_IMAGE="${SCW_IMAGE:-}"
 SCW_SERVER_NAME="${SCW_SERVER_NAME:-llm-ministral-vllm}"
 SCW_VOLUME_SIZE_GB="${SCW_VOLUME_SIZE_GB:-80}"
 SCW_ROOT_VOLUME="${SCW_ROOT_VOLUME:-sbs:${SCW_VOLUME_SIZE_GB}GB}"
+SCW_SERVER_IP="${SCW_SERVER_IP:-dynamic}"
+SCW_DETACH_PUBLIC_IP_AFTER_DEPLOY="${SCW_DETACH_PUBLIC_IP_AFTER_DEPLOY:-false}"
+SCW_PRIVATE_NETWORK_NAME="${SCW_PRIVATE_NETWORK_NAME:-}"
+SCW_REGION="${SCW_REGION:-}"
 SCW_SSH_USER="${SCW_SSH_USER:-root}"
 SCW_SSH_PUBLIC_KEY_PATH="${SCW_SSH_PUBLIC_KEY_PATH:-$HOME/.ssh/scaleway.pub}"
 SCW_SSH_PRIVATE_KEY_PATH="${SCW_SSH_PRIVATE_KEY_PATH:-}"
 SCW_IMAGE_FALLBACK="${SCW_IMAGE_FALLBACK:-ubuntu_jammy}"
+
+expand_home_path() {
+  case "$1" in
+    "~") printf '%s\n' "$HOME" ;;
+    ~/*) printf '%s/%s\n' "$HOME" "${1#~/}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+SCW_SSH_PUBLIC_KEY_PATH="$(expand_home_path "${SCW_SSH_PUBLIC_KEY_PATH}")"
+SCW_SSH_PRIVATE_KEY_PATH="$(expand_home_path "${SCW_SSH_PRIVATE_KEY_PATH}")"
 
 MODEL_ID="${MODEL_ID:-mistralai/Ministral-3-8B-Instruct-2512}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-ministral-8b}"
@@ -37,16 +52,116 @@ VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:latest}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 VLLM_BIND_IP="${VLLM_BIND_IP:-0.0.0.0}"
 VLLM_ALLOWED_CIDRS="${VLLM_ALLOWED_CIDRS:-}"
+VLLM_ALLOWED_CIDRS_FROM_SERVER_NAME="${VLLM_ALLOWED_CIDRS_FROM_SERVER_NAME:-}"
 VLLM_DTYPE="${VLLM_DTYPE:-float16}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-24}"
+VLLM_READY_TIMEOUT_SEC="${VLLM_READY_TIMEOUT_SEC:-900}"
 HF_CACHE_DIR="${HF_CACHE_DIR:-/data/models}"
 HUGGING_FACE_HUB_TOKEN="${HUGGING_FACE_HUB_TOKEN:-}"
 
 if ! scw info >/dev/null 2>&1; then
   echo "Scaleway CLI is not configured. Run: scw init" >&2
   exit 1
+fi
+
+if [[ -n "${VLLM_ALLOWED_CIDRS_FROM_SERVER_NAME}" ]]; then
+  echo "Resolving allowlist CIDR from instance: ${VLLM_ALLOWED_CIDRS_FROM_SERVER_NAME}"
+  SOURCE_SERVER_LIST_JSON="$(scw instance server list zone="${SCW_ZONE}" name="${VLLM_ALLOWED_CIDRS_FROM_SERVER_NAME}" -o json)"
+  SOURCE_SERVER_MATCH_COUNT="$(printf '%s' "${SOURCE_SERVER_LIST_JSON}" | python3 -c 'import sys, json; d=json.load(sys.stdin); items=d.get("servers", []) if isinstance(d, dict) else (d if isinstance(d, list) else []); print(len(items))')"
+
+  if [[ "${SOURCE_SERVER_MATCH_COUNT}" == "0" ]]; then
+    echo "No instance found named ${VLLM_ALLOWED_CIDRS_FROM_SERVER_NAME} in ${SCW_ZONE}." >&2
+    exit 1
+  fi
+
+  if [[ "${SOURCE_SERVER_MATCH_COUNT}" != "1" ]]; then
+    echo "Found ${SOURCE_SERVER_MATCH_COUNT} instances named ${VLLM_ALLOWED_CIDRS_FROM_SERVER_NAME} in ${SCW_ZONE}." >&2
+    echo "Disambiguate instance names before using VLLM_ALLOWED_CIDRS_FROM_SERVER_NAME." >&2
+    exit 1
+  fi
+
+  SOURCE_SERVER_ID="$(printf '%s' "${SOURCE_SERVER_LIST_JSON}" | python3 -c 'import sys, json; d=json.load(sys.stdin); items=d.get("servers", []) if isinstance(d, dict) else (d if isinstance(d, list) else []); print(items[0].get("id", "") if items else "")')"
+
+  SOURCE_SERVER_IP=""
+  if [[ -n "${SCW_PRIVATE_NETWORK_NAME}" ]]; then
+    SOURCE_SERVER_GET_JSON="$(scw instance server get "${SOURCE_SERVER_ID}" zone="${SCW_ZONE}" -o json)"
+    SOURCE_SERVER_PRIVATE_NIC_ID="$(printf '%s' "${SOURCE_SERVER_GET_JSON}" | python3 -c 'import sys, json; d=json.load(sys.stdin); private_nics=d.get("private_nics", []) if isinstance(d, dict) else []; target=sys.argv[1]; match=next((nic for nic in private_nics if isinstance(nic, dict) and (nic.get("private_network_name") or "") == target), {}); print(match.get("id", ""))' "${SCW_PRIVATE_NETWORK_NAME}")"
+
+    if [[ -n "${SOURCE_SERVER_PRIVATE_NIC_ID}" ]]; then
+      SOURCE_SERVER_REGION="${SCW_ZONE%-*}"
+      SOURCE_SERVER_IPAM_JSON="$(scw ipam ip list region="${SOURCE_SERVER_REGION}" resource-id="${SOURCE_SERVER_PRIVATE_NIC_ID}" resource-type=instance_private_nic attached=true is-ipv6=false -o json)"
+      SOURCE_SERVER_IP="$(printf '%s' "${SOURCE_SERVER_IPAM_JSON}" | python3 -c 'import sys, json; d=json.load(sys.stdin); items=d.get("ips", []) if isinstance(d, dict) else (d if isinstance(d, list) else []); addr=(items[0].get("address", "") if items and isinstance(items[0], dict) else ""); print((addr.split("/")[0] if isinstance(addr, str) else ""))')"
+    fi
+    fi
+
+    if [[ -z "${SOURCE_SERVER_IP}" ]]; then
+      SOURCE_SERVER_IP="$(printf '%s' "${SOURCE_SERVER_LIST_JSON}" | python3 -c 'import sys, json; d=json.load(sys.stdin); items=d.get("servers", []) if isinstance(d, dict) else (d if isinstance(d, list) else []); s=items[0] if items else {}; ip=((s.get("public_ip") or {}).get("address", "")) or next((p.get("address", "") for p in (s.get("public_ips") or []) if isinstance(p, dict) and p.get("address")), "") or (s.get("private_ip") or ""); print(ip)')"
+    fi
+
+  if [[ -z "${SOURCE_SERVER_IP}" ]]; then
+    echo "Could not resolve IP for instance ${VLLM_ALLOWED_CIDRS_FROM_SERVER_NAME}." >&2
+    exit 1
+  fi
+
+  AUTO_ALLOWED_CIDR="${SOURCE_SERVER_IP}/32"
+  if [[ -z "${VLLM_ALLOWED_CIDRS// }" ]]; then
+    VLLM_ALLOWED_CIDRS="${AUTO_ALLOWED_CIDR}"
+  else
+    VLLM_ALLOWED_CIDRS="${VLLM_ALLOWED_CIDRS},${AUTO_ALLOWED_CIDR}"
+  fi
+
+  echo "Resolved allowlist CIDR: ${AUTO_ALLOWED_CIDR}"
+fi
+
+if [[ "${SCW_SERVER_IP}" != "new" && "${SCW_SERVER_IP}" != "ipv4" && "${SCW_SERVER_IP}" != "ipv6" && "${SCW_SERVER_IP}" != "both" && "${SCW_SERVER_IP}" != "dynamic" && "${SCW_SERVER_IP}" != "none" ]]; then
+  echo "SCW_SERVER_IP must be one of: new, ipv4, ipv6, both, dynamic, none" >&2
+  exit 1
+fi
+
+if [[ "${SCW_DETACH_PUBLIC_IP_AFTER_DEPLOY}" != "true" && "${SCW_DETACH_PUBLIC_IP_AFTER_DEPLOY}" != "false" ]]; then
+  echo "SCW_DETACH_PUBLIC_IP_AFTER_DEPLOY must be either true or false" >&2
+  exit 1
+fi
+
+if [[ "${SCW_SERVER_IP}" == "none" && -z "${SCW_PRIVATE_NETWORK_NAME}" ]]; then
+  echo "SCW_PRIVATE_NETWORK_NAME is required when SCW_SERVER_IP=none." >&2
+  exit 1
+fi
+
+if [[ -z "${SCW_REGION}" ]]; then
+  SCW_REGION="${SCW_ZONE%-*}"
+fi
+
+if [[ -z "${SCW_REGION}" ]]; then
+  echo "Could not derive SCW_REGION from SCW_ZONE=${SCW_ZONE}. Set SCW_REGION explicitly." >&2
+  exit 1
+fi
+
+PRIVATE_NETWORK_ID=""
+if [[ -n "${SCW_PRIVATE_NETWORK_NAME}" ]]; then
+  echo "Resolving private network '${SCW_PRIVATE_NETWORK_NAME}' in region ${SCW_REGION}"
+  PN_LIST_JSON="$(scw vpc private-network list region="${SCW_REGION}" name="${SCW_PRIVATE_NETWORK_NAME}" -o json)"
+  PN_MATCH_COUNT="$(printf '%s' "${PN_LIST_JSON}" | python3 -c 'import sys, json; target=sys.argv[1]; d=json.load(sys.stdin); pns=d.get("private_networks", []) if isinstance(d, dict) else (d if isinstance(d, list) else []); exact=[pn for pn in pns if (pn.get("name") or "") == target]; print(len(exact))' "${SCW_PRIVATE_NETWORK_NAME}")"
+
+  if [[ "${PN_MATCH_COUNT}" == "0" ]]; then
+    echo "No private network named ${SCW_PRIVATE_NETWORK_NAME} found in region ${SCW_REGION}." >&2
+    exit 1
+  fi
+
+  if [[ "${PN_MATCH_COUNT}" != "1" ]]; then
+    echo "Found ${PN_MATCH_COUNT} private networks named ${SCW_PRIVATE_NETWORK_NAME} in region ${SCW_REGION}." >&2
+    echo "Please disambiguate by renaming network or filtering by project." >&2
+    exit 1
+  fi
+
+  PRIVATE_NETWORK_ID="$(printf '%s' "${PN_LIST_JSON}" | python3 -c 'import sys, json; target=sys.argv[1]; d=json.load(sys.stdin); pns=d.get("private_networks", []) if isinstance(d, dict) else (d if isinstance(d, list) else []); exact=[pn for pn in pns if (pn.get("name") or "") == target]; print(exact[0].get("id", "") if exact else "")' "${SCW_PRIVATE_NETWORK_NAME}")"
+
+  if [[ -z "${PRIVATE_NETWORK_ID}" ]]; then
+    echo "Could not resolve private network ID for ${SCW_PRIVATE_NETWORK_NAME}." >&2
+    exit 1
+  fi
 fi
 
 if [[ -z "${SCW_IMAGE}" ]]; then
@@ -134,8 +249,8 @@ CREATE_JSON="$(scw instance server create \
   name="${SCW_SERVER_NAME}" \
   type="${SCW_COMMERCIAL_TYPE}" \
   image="${SCW_IMAGE}" \
+  ip="${SCW_SERVER_IP}" \
   root-volume="${SCW_ROOT_VOLUME}" \
-  dynamic-ip-required=true \
   ${CLOUD_INIT_ARG} \
   -o json)"
 SERVER_ID="$(printf '%s' "${CREATE_JSON}" | python3 -c 'import sys, json; d=json.load(sys.stdin); out="";
@@ -156,10 +271,53 @@ fi
 
 [[ -n "${TMP_CLOUD_INIT_FILE:-}" ]] && rm -f "${TMP_CLOUD_INIT_FILE}"
 
+if [[ -n "${PRIVATE_NETWORK_ID}" ]]; then
+  echo "Attaching server to private network ${SCW_PRIVATE_NETWORK_NAME} (${PRIVATE_NETWORK_ID})"
+  EXISTING_NICS_JSON="$(scw instance private-nic list server-id="${SERVER_ID}" zone="${SCW_ZONE}" -o json)"
+  HAS_NIC_FOR_NETWORK="$(printf '%s' "${EXISTING_NICS_JSON}" | python3 -c 'import sys, json; target=sys.argv[1]; d=json.load(sys.stdin); nics=d.get("private_nics", []) if isinstance(d, dict) else (d if isinstance(d, list) else []); print("1" if any((nic.get("private_network_id") or "") == target for nic in nics if isinstance(nic, dict)) else "0")' "${PRIVATE_NETWORK_ID}")"
+
+  if [[ "${HAS_NIC_FOR_NETWORK}" == "0" ]]; then
+    scw instance private-nic create server-id="${SERVER_ID}" private-network-id="${PRIVATE_NETWORK_ID}" zone="${SCW_ZONE}" >/dev/null
+  else
+    echo "Server already attached to private network ${SCW_PRIVATE_NETWORK_NAME}."
+  fi
+fi
+
 echo "Waiting for server to be ready..."
 scw instance server wait "${SERVER_ID}" zone="${SCW_ZONE}" >/dev/null
 
 SERVER_IP=""
+if [[ "${SCW_SERVER_IP}" == "none" ]]; then
+  for _ in {1..30}; do
+    SERVER_JSON="$(scw instance server get "${SERVER_ID}" zone="${SCW_ZONE}" -o json)"
+    SERVER_IP="$(printf '%s' "${SERVER_JSON}" | python3 -c 'import sys, json, ipaddress; d=json.load(sys.stdin); server=((d.get("server") if isinstance(d, dict) and isinstance(d.get("server"), dict) else None) or (d if isinstance(d, dict) else {})); vals=[];
+def walk(x):
+    if isinstance(x, dict):
+        for v in x.values():
+            walk(v)
+    elif isinstance(x, list):
+        for v in x:
+            walk(v)
+    elif isinstance(x, str):
+        vals.append(x)
+walk(server)
+for s in vals:
+    try:
+        ip=ipaddress.ip_address(s)
+    except Exception:
+        continue
+    if ip.version==4 and ip.is_private and not ip.is_loopback:
+        print(str(ip));
+        raise SystemExit(0)
+print("")')"
+
+    if [[ -n "${SERVER_IP}" ]]; then
+      break
+    fi
+
+    sleep 2
+  done
+else
 for _ in {1..30}; do
   SERVER_JSON="$(scw instance server get "${SERVER_ID}" zone="${SCW_ZONE}" -o json)"
   SERVER_IP="$(printf '%s' "${SERVER_JSON}" | python3 -c 'import sys, json; d=json.load(sys.stdin); server=((d.get("server") if isinstance(d, dict) and isinstance(d.get("server"), dict) else None) or (d if isinstance(d, dict) else {})); ip=((server.get("public_ip") or {}).get("address",""));
@@ -175,9 +333,16 @@ print(ip)')"
 
   sleep 2
 done
+fi
 
 if [[ -z "${SERVER_IP}" ]]; then
-  echo "Could not resolve server public IP" >&2
+  if [[ "${SCW_SERVER_IP}" == "none" ]]; then
+    echo "Could not resolve server private IP." >&2
+    echo "Check that the private network is attached and has DHCP/IPAM enabled." >&2
+  else
+    echo "Could not resolve server public IP." >&2
+    echo "If no public IP was attached, set SCW_SERVER_IP=dynamic or attach an IP manually." >&2
+  fi
   exit 1
 fi
 
@@ -213,6 +378,7 @@ VLLM_DTYPE=${VLLM_DTYPE}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION}
 MAX_MODEL_LEN=${MAX_MODEL_LEN}
 MAX_NUM_SEQS=${MAX_NUM_SEQS}
+VLLM_READY_TIMEOUT_SEC=${VLLM_READY_TIMEOUT_SEC}
 HF_CACHE_DIR=${HF_CACHE_DIR}
 HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
 EOF
@@ -307,10 +473,41 @@ apply_vllm_allowlist() {
 }
 
 apply_vllm_allowlist
+
+wait_for_vllm_ready() {
+  local timeout_sec="${VLLM_READY_TIMEOUT_SEC:-900}"
+  local interval_sec=5
+  local elapsed=0
+
+  while (( elapsed < timeout_sec )); do
+    if curl -fsS -m 4 "http://127.0.0.1:${VLLM_PORT:-8000}/v1/models" >/dev/null 2>&1; then
+      echo "vLLM API is ready on /v1/models"
+      return 0
+    fi
+    sleep "${interval_sec}"
+    elapsed=$((elapsed + interval_sec))
+  done
+
+  echo "vLLM did not become ready within ${timeout_sec}s." >&2
+  docker logs --tail 120 vllm-ministral >&2 || true
+  return 1
+}
+
+wait_for_vllm_ready
 REMOTE
+
+if [[ "${SCW_DETACH_PUBLIC_IP_AFTER_DEPLOY}" == "true" && "${SCW_SERVER_IP}" != "none" ]]; then
+  echo "Detaching public IP from server ${SCW_SERVER_NAME}"
+  scw instance server update "${SERVER_ID}" zone="${SCW_ZONE}" dynamic-ip-required=false >/dev/null
+fi
 
 echo
 echo "Deployment complete."
-echo "OpenAI-compatible endpoint: http://${SERVER_IP}:${VLLM_PORT}/v1"
-echo "Test with:"
-echo "curl http://${SERVER_IP}:${VLLM_PORT}/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"${SERVED_MODEL_NAME}\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}'"
+if [[ "${SCW_DETACH_PUBLIC_IP_AFTER_DEPLOY}" == "true" && "${SCW_SERVER_IP}" != "none" ]]; then
+  echo "Public IP detached. Server is now private-network only."
+  echo "Use your private network/bastion host to reach ${SCW_SERVER_NAME}."
+else
+  echo "OpenAI-compatible endpoint: http://${SERVER_IP}:${VLLM_PORT}/v1"
+  echo "Test with:"
+  echo "curl http://${SERVER_IP}:${VLLM_PORT}/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"${SERVED_MODEL_NAME}\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}'"
+fi
