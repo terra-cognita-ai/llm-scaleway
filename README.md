@@ -140,7 +140,7 @@ If you see OOM under load, lower:
 
 ## Destroy instance
 
-To tear down the GPU server and its volumes:
+To tear down the GPU server, its volumes, and any attached flexible/public IP resources:
 
 ```bash
 chmod +x scripts/destroy-scaleway.sh
